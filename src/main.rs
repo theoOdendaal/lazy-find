@@ -5,9 +5,9 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::Terminal;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::CrosstermBackend;
-use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::style::{Color, Style, Stylize};
+use ratatui::text::{Span, Text};
+use ratatui::widgets::{Block, Borders, List, ListDirection, ListState, Paragraph};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
 use std::borrow::Cow;
@@ -15,10 +15,13 @@ use std::fs;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
-use tokio::select;
+use std::time::Instant;
 
 // TODO use more effecient data structures?
+// TODO, currently spaces are ignored? It's not even pushed to query. Is this fine?
+// TODO better manage list selection. As currently it remains constant when typing and then falls off when selected exceeds index.
+// TODO update query asynchronous and add debouncing to filter logic. i.e. query should be updated independently of filtering logic, and only apply filtering logic after a delay.
+// TODO implement a watcher using notify, in order to update fs data without having to rescan entire disk during runtime.
 
 /// Recursively traverse forward from the specified directory
 /// in parallel returning a vec of file names.
@@ -139,10 +142,10 @@ fn greedy_match_score(query_bytes: &[u8], target_bytes: &[u8]) -> (bool, i32) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    //let file = "paths.bincode";
-    //let file_population = load_paths(file)?;
+    let file = "paths.bincode";
+    let file_population = load_paths(file)?;
     //let start = Instant::now();
-    let file_population = walk_dir_par(Path::new("/"));
+    //let file_population = walk_dir_par(Path::new("/"));
     //println!("{:?}", file_population.len());
     //println!("{:?}", start.elapsed());
     //save_paths(&file_population, file)?;
@@ -178,23 +181,11 @@ async fn run_app<B: ratatui::backend::Backend>(
 ) -> io::Result<()> {
     let mut query = String::new();
     let mut last_query = String::from(" ");
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-
-    tokio::spawn(async move {
-        loop {
-            if crossterm::event::poll(std::time::Duration::from_millis(50)).unwrap() {
-                if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
-                    if tx.send(key).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
+    let mut list_state = ListState::default().with_selected(Some(0));
+    let mut filtered: Vec<Cow<str>> = Vec::new();
 
     // Pre cash paths.
-    // 0 = file name (stripped of spaces) - used for matching.
+    // 0 = file name as bytes (stripped of spaces) - used for matching.
     // 1 = full path - used for display.
     let cached_paths: Vec<(Vec<u8>, Cow<str>)> = file_population
         .par_iter()
@@ -211,118 +202,102 @@ async fn run_app<B: ratatui::backend::Backend>(
         })
         .collect();
 
-    let debounce_timer = tokio::time::sleep(Duration::from_millis(50));
-    tokio::pin!(debounce_timer);
-
     loop {
-        select! {
-                    // Handle keypresses
-                    Some(key_event) = rx.recv() => {
-                        if let crossterm::event::KeyEvent { code, kind: KeyEventKind::Press, .. } = key_event {
-                            match code {
-                                KeyCode::Char('q') => break,
-                                KeyCode::Char(c) => query.push(c),
-                                KeyCode::Backspace => { query.pop(); },
-                                _ => {}
-                            }
-
-                            debounce_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(50));
-                        }
-                    }
-
-                    () = &mut debounce_timer => {
-
-                        if query != last_query {
-
-                            let query_as_bytes: Vec<u8> = query.bytes().filter(|b| *b != b' ').collect();
-
-                            let mut filtered: Vec<(i32, Cow<str>)> = cached_paths
-                                .par_iter()
-                                .filter_map(|(name, path)| {
-                                    let (is_match, score) = greedy_match_score(&query_as_bytes, name);
-                                    if is_match {
-                                        Some((score, path.clone()))
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-
-                            filtered.par_sort_unstable_by(|a, b| b.0.cmp(&a.0));
-
-                            let filtered: Vec<Cow<str>> = filtered
-                                .into_iter()
-                                .map(|(_, path)| path)
-                                .collect();
-
-                            last_query = query.clone();
-
-                            // Render terminal
-                            terminal.draw(|f| {
-                                let chunks = Layout::default()
-                                    .direction(Direction::Vertical)
-                                    .margin(1)
-                                    .constraints([
-                                        Constraint::Min(1),
-                                        Constraint::Length(3),
-                                    ])
-                                    .split(f.area());
-
-                                let result_lines: Vec<Line> = filtered
-                                    .iter()
-                                    .take(30)
-                                    .map(|line| {
-                                        Line::from(Span::raw(
-                                            line.to_string()
-                                        ))
-                                    })
-                                    .collect();
-                                /*
-                                let results = Paragraph::new(result_lines)
-                                    .block(Block::default().title("lazy-find").borders(Borders::ALL));
-                                f.render_widget(results, chunks[0]);
-
-                                let input = Paragraph::new(Text::from(Span::raw(&query)))
-                                    .block(Block::default().borders(Borders::ALL));
-                                f.render_widget(input, chunks[1]);
-                                */
-
-                                let results = Paragraph::new(result_lines)
-            .block(
-                Block::default()
-                    .title(Span::styled(
-                        " lazy-find ",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            )
-            .style(Style::default().fg(Color::White));
-        f.render_widget(results, chunks[0]);
-
-        let input = Paragraph::new(Text::from(Span::styled(
-            &query,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::ITALIC),
-        )))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    " query ",
-                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-                ))
-                .border_style(Style::default().fg(Color::DarkGray)),
-        );
-        f.render_widget(input, chunks[1]);
-
-                        })?;
-                    }}
+        // Handle keypresses
+        if let crossterm::event::Event::Key(crossterm::event::KeyEvent {
+            code,
+            kind: KeyEventKind::Press,
+            ..
+        }) = crossterm::event::read()?
+        {
+            match code {
+                KeyCode::Esc => break,
+                // Ignore spaces. Won't render
+                KeyCode::Char(' ') => continue,
+                KeyCode::Char(c) => query.push(c),
+                KeyCode::Backspace => {
+                    query.pop();
                 }
-    }
+                KeyCode::Up => {
+                    list_state.select_next();
+                }
 
+                KeyCode::Down => {
+                    list_state.select_previous();
+                }
+                _ => {}
+            }
+        }
+
+        if query != last_query {
+            let query_as_bytes: Vec<u8> = query.bytes().filter(|b| *b != b' ').collect();
+
+            let mut matched: Vec<(i32, Cow<str>)> = cached_paths
+                .par_iter()
+                .filter_map(|(name, path)| {
+                    let (is_match, score) = greedy_match_score(&query_as_bytes, name);
+                    if is_match {
+                        Some((score, path.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            matched.par_sort_unstable_by(|a, b| b.0.cmp(&a.0));
+
+            filtered = matched
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect::<Vec<Cow<str>>>();
+
+            last_query = query.clone();
+        }
+
+        // Render terminal
+        terminal.draw(|f| {
+            // Define layout.
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([Constraint::Min(1), Constraint::Length(3)])
+                .split(f.area());
+
+            // Define overarching style.
+            let app_style = Style::default()
+                .bg(Color::Rgb(31, 35, 53))
+                .fg(Color::Rgb(220, 215, 186));
+
+            // Define results widget.
+            let results: List = List::new(
+                filtered
+                    .iter()
+                    .take(30)
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>(),
+            )
+            .style(app_style)
+            .block(Block::default().title("lazy-find").borders(Borders::ALL))
+            .highlight_style(Style::new().italic().bold())
+            .highlight_symbol(">>")
+            .repeat_highlight_symbol(true)
+            .highlight_spacing(ratatui::widgets::HighlightSpacing::Always)
+            .direction(ListDirection::BottomToTop);
+
+            // Define input widget.
+            let input = Paragraph::new(Text::from(Span::raw(&query)))
+                .style(app_style)
+                .block(
+                    Block::default()
+                        .title(format!("{}", filtered.len()))
+                        .borders(Borders::ALL),
+                );
+
+            // Render widgets.
+            f.render_stateful_widget(results, chunks[0], &mut list_state);
+            f.render_widget(input, chunks[1]);
+        })?;
+        //}
+    }
     Ok(())
 }
