@@ -49,7 +49,7 @@ fn collect_entry_paths(entry: DirEntry) -> Vec<PathBuf> {
 
     match entry.file_type() {
         Ok(file_type) if file_type.is_file() => vec![path],
-        Ok(file_type) if file_type.is_dir() && !should_ignore(&entry) => walk_dir_par(&path),
+        Ok(file_type) if file_type.is_dir() && !should_ignore_walk(&entry) => walk_dir_par(&path),
         _ => vec![],
     }
 }
@@ -70,7 +70,11 @@ fn save_paths(paths: &Vec<PathBuf>, path: &str) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-fn should_ignore(entry: &DirEntry) -> bool {
+// FIXME currently this would only work at the root directory.
+// FIXME Rather make it apply to the last path component?
+/// Logic used to decide whether a specific directory should
+/// be traversed during fs walk.
+fn should_ignore_walk(entry: &DirEntry) -> bool {
     const EXCLUDED_DIRS: &[&str] = &["/$Recycle.Bin/", "/$SysReset", "/Windows"];
     let path = entry.path();
 
@@ -80,6 +84,7 @@ fn should_ignore(entry: &DirEntry) -> bool {
     })
 }
 
+/// Sub-sequence scoring logic.
 fn greedy_match_score(query_bytes: &[u8], target_bytes: &[u8]) -> (bool, i32) {
     let mut q_idx = 0;
     let mut score = 0;
@@ -122,9 +127,10 @@ fn greedy_match_score(query_bytes: &[u8], target_bytes: &[u8]) -> (bool, i32) {
     }
 }
 
-/// Applies greedy matching logic to sort pre-processed data.
-/// Expect a string as bytes, second tuple value represents the
-/// displayed value.
+/// Applies greedy matching logic to filter and sort pre-processed data.
+/// Expect a slice of tuples, the first pos representing the element to
+/// which  greedy matching logic is applied to, and the second
+/// the element which will be presented.
 fn greedy_match_filter<'a>(
     target: Vec<u8>,
     pre_processed: &'a [(Vec<u8>, Cow<'a, str>)],
@@ -157,7 +163,24 @@ fn prepare_fuzzy_target(target: &str) -> Vec<u8> {
         .collect()
 }
 
-// How to make this faster?
+fn prepare_paths_for_seach<'a>(paths: &'a [PathBuf]) -> Vec<(Vec<u8>, Cow<'a, str>)> {
+    paths
+        .par_iter()
+        .filter_map(|s| {
+            let file_name: Vec<u8> = s
+                .file_name()?
+                .to_string_lossy()
+                .to_lowercase()
+                .bytes()
+                .filter(|b| *b != b' ')
+                .collect();
+            let full_path = s.to_string_lossy();
+
+            Some((file_name, Cow::Owned(full_path.into_owned())))
+        })
+        .collect()
+}
+
 async fn unique_parent_dirs(paths: &[PathBuf]) -> Vec<String> {
     let mut unique_dirs = HashSet::new();
 
@@ -240,21 +263,7 @@ async fn run_app<B: ratatui::backend::Backend>(
     // to bytes for faster iterations compared to chars().
     // Space stripped file name is stored as bytes at pos 0 of the tuple,
     // while the full path is stored at pos 1.
-    let cached_paths: Vec<(Vec<u8>, Cow<str>)> = file_population
-        .par_iter()
-        .filter_map(|s| {
-            let file_name: Vec<u8> = s
-                .file_name()?
-                .to_string_lossy()
-                .to_lowercase()
-                .bytes()
-                .filter(|b| *b != b' ')
-                .collect();
-            let full_path = s.to_string_lossy();
-
-            Some((file_name, Cow::Owned(full_path.into_owned())))
-        })
-        .collect();
+    let cached_paths = prepare_paths_for_seach(&file_population);
 
     let raw_dirs = unique_parent_dirs(&file_population).await;
     let cached_dirs: Vec<(Vec<u8>, Cow<str>)> = raw_dirs
@@ -267,7 +276,6 @@ async fn run_app<B: ratatui::backend::Backend>(
         })
         .collect();
 
-    //////////////////////////////////////// ASYNC
     // Create channel for keystrokes using tokio.
     // Used to decouple keystrokes from other logic.
     let (tx_query, mut rx_query) = tokio::sync::mpsc::channel(100);
