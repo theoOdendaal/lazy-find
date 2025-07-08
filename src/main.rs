@@ -1,4 +1,3 @@
-use bincode::decode_from_std_read;
 use crossterm::event::{KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -8,17 +7,15 @@ use ratatui::prelude::CrosstermBackend;
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListDirection, ListState, Paragraph};
-use rayon::iter::{
-    IntoParallelIterator, IntoParallelRefIterator, ParallelBridge, ParallelIterator,
-};
-use rayon::slice::ParallelSliceMut;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::borrow::Cow;
-use std::collections::HashSet;
-use std::fs::File;
-use std::fs::{self, DirEntry};
-use std::io::{self, BufReader, BufWriter};
-use std::path::{Path, PathBuf};
-use std::time::Instant;
+
+use std::io::{self};
+use std::path::PathBuf;
+
+mod fs_walk;
+mod greedy_match;
+mod persistence;
 
 // TODO use more effecient data structures?
 // TODO, currently spaces are ignored? It's not even pushed to query. Is this fine?
@@ -28,173 +25,6 @@ use std::time::Instant;
 // TODO perhaps let walk_dir_par return an iter? as there is technically no need to collect it?
 // TODO refactor code to be more modular?
 
-/// Recursively traverse the directory tree from `dir` in parallel,
-/// returning a list of file paths (excluding directories).
-pub fn walk_dir_par(dir: &Path) -> Vec<PathBuf> {
-    match fs::read_dir(dir) {
-        Ok(read_dir) => read_dir
-            .par_bridge()
-            .flat_map(|entry_result| match entry_result {
-                Ok(entry) => collect_entry_paths(entry),
-                Err(_) => vec![],
-            })
-            .collect(),
-        Err(_) => vec![],
-    }
-}
-
-/// Handle one directory entry: recurse if it's a dir, return path if it's a file.
-fn collect_entry_paths(entry: DirEntry) -> Vec<PathBuf> {
-    let path = entry.path();
-
-    match entry.file_type() {
-        Ok(file_type) if file_type.is_file() => vec![path],
-        Ok(file_type) if file_type.is_dir() && !should_ignore_walk(&entry) => walk_dir_par(&path),
-        _ => vec![],
-    }
-}
-
-fn load_paths(path: &str) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
-    let start = Instant::now();
-    let mut file = BufReader::new(File::open(path)?);
-    let cfg = bincode::config::standard();
-    let paths = decode_from_std_read(&mut file, cfg)?;
-    println!("{:?}", start.elapsed());
-    Ok(paths)
-}
-
-fn save_paths(paths: &Vec<PathBuf>, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut file = BufWriter::new(File::create(path)?);
-    let cfg = bincode::config::standard();
-    bincode::encode_into_std_write(paths, &mut file, cfg)?;
-    Ok(())
-}
-
-// FIXME currently this would only work at the root directory.
-// FIXME Rather make it apply to the last path component?
-/// Logic used to decide whether a specific directory should
-/// be traversed during fs walk.
-fn should_ignore_walk(entry: &DirEntry) -> bool {
-    const EXCLUDED_DIRS: &[&str] = &["/$Recycle.Bin/", "/$SysReset", "/Windows"];
-    let path = entry.path();
-
-    EXCLUDED_DIRS.iter().any(|excluded| {
-        let excluded_path = Path::new(excluded);
-        path.starts_with(excluded_path)
-    })
-}
-
-/// Sub-sequence scoring logic.
-fn greedy_match_score(query_bytes: &[u8], target_bytes: &[u8]) -> (bool, i32) {
-    let mut q_idx = 0;
-    let mut score = 0;
-    let mut last_match_idx = None;
-    let mut first_match_idx = None;
-
-    for (t_idx, &t_char) in target_bytes.iter().enumerate() {
-        if q_idx == query_bytes.len() {
-            break;
-        }
-
-        if t_char == query_bytes[q_idx] {
-            score += 10;
-
-            if let Some(last) = last_match_idx {
-                let gap = t_idx - last;
-                if gap <= 1 {
-                    score += 5;
-                }
-            } else {
-                first_match_idx = Some(t_idx);
-            }
-
-            last_match_idx = Some(t_idx);
-            q_idx += 1;
-        }
-    }
-
-    let is_match = q_idx == query_bytes.len();
-    // TODO potentially allow 1 deviation?
-    //let is_match = q_idx + 1 >= query_bytes.len();
-
-    if is_match {
-        if let Some(first_idx) = first_match_idx {
-            score += 20 - first_idx.min(20);
-        }
-        (true, score as i32)
-    } else {
-        (false, 0)
-    }
-}
-
-/// Applies greedy matching logic to filter and sort pre-processed data.
-/// Expect a slice of tuples, the first pos representing the element to
-/// which  greedy matching logic is applied to, and the second
-/// the element which will be presented.
-fn greedy_match_filter<'a>(
-    target: Vec<u8>,
-    pre_processed: &'a [(Vec<u8>, Cow<'a, str>)],
-) -> Vec<Cow<'a, str>> {
-    let mut matched: Vec<(i32, Cow<str>)> = pre_processed
-        .par_iter()
-        .filter_map(|(value, disp)| {
-            let (is_match, score) = greedy_match_score(&target, value);
-            if is_match {
-                Some((score, disp.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    matched.par_sort_unstable_by(|a, b| b.0.cmp(&a.0));
-
-    matched
-        .into_par_iter()
-        .map(|(_, path)| path)
-        .collect::<Vec<Cow<str>>>()
-}
-
-fn prepare_fuzzy_target(target: &str) -> Vec<u8> {
-    target
-        .to_lowercase()
-        .bytes()
-        .filter(|b| *b != b' ')
-        .collect()
-}
-
-fn prepare_paths_for_seach<'a>(paths: &'a [PathBuf]) -> Vec<(Vec<u8>, Cow<'a, str>)> {
-    paths
-        .par_iter()
-        .filter_map(|s| {
-            let file_name: Vec<u8> = s
-                .file_name()?
-                .to_string_lossy()
-                .to_lowercase()
-                .bytes()
-                .filter(|b| *b != b' ')
-                .collect();
-            let full_path = s.to_string_lossy();
-
-            Some((file_name, Cow::Owned(full_path.into_owned())))
-        })
-        .collect()
-}
-
-async fn unique_parent_dirs(paths: &[PathBuf]) -> Vec<String> {
-    let mut unique_dirs = HashSet::new();
-
-    for path in paths {
-        if let Some(parent) = path.parent() {
-            unique_dirs.insert(parent.to_path_buf());
-        }
-    }
-    unique_dirs
-        .into_par_iter()
-        .map(|pb| pb.to_string_lossy().to_string())
-        .collect()
-}
-
 #[derive(PartialEq, Eq)]
 enum AppMode {
     FileSearch,
@@ -203,16 +33,13 @@ enum AppMode {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    //let file = "paths.bincode";
-
-    let start = Instant::now();
-    let file_population = walk_dir_par(Path::new("/"));
-    println!("{:?}", start.elapsed());
+    let file = "paths.bincode";
+    //let start = Instant::now();
+    //let file_population = fs_walk::walk_dir_par(Path::new("/"));
+    //println!("{:?}", start.elapsed());
     //let file_population = tokio::task::spawn_blocking(|| walk_dir_par(Path::new("/"))).await?;
-    //save_paths(&file_population, file)?;
-
-    //let file_population =
-    //    tokio::task::spawn_blocking(|| load_paths(file).unwrap_or_default()).await?;
+    //persistence::save_paths(&file_population, file)?;
+    let file_population = persistence::load_paths(file).await?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -220,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     execute!(
         stdout,
         crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableMouseCapture,
     )?;
 
     let backend = CrosstermBackend::new(stdout);
@@ -251,7 +78,7 @@ async fn run_app<B: ratatui::backend::Backend>(
 
     let mut current_app_mode = AppMode::FileSearch;
 
-    let mut diretory_query = String::new();
+    let mut directory_query = String::new();
     let mut last_directory_query = String::from(" ");
     let mut filtered_dirs: Vec<Cow<str>> = Vec::new();
     let mut dir_list_state = ListState::default().with_selected(Some(0));
@@ -263,9 +90,9 @@ async fn run_app<B: ratatui::backend::Backend>(
     // to bytes for faster iterations compared to chars().
     // Space stripped file name is stored as bytes at pos 0 of the tuple,
     // while the full path is stored at pos 1.
-    let cached_paths = prepare_paths_for_seach(&file_population);
+    let cached_paths = greedy_match::prepare_paths_for_seach(&file_population);
 
-    let raw_dirs = unique_parent_dirs(&file_population).await;
+    let raw_dirs = fs_walk::unique_parent_dirs(&file_population).await;
     let cached_dirs: Vec<(Vec<u8>, Cow<str>)> = raw_dirs
         .par_iter()
         .map(|s| {
@@ -325,9 +152,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                 KeyCode::Char(':') => current_app_mode = AppMode::FileSearch,
                 KeyCode::Esc => break,
                 KeyCode::Char(' ') => continue,
-                KeyCode::Char(c) => diretory_query.push(c),
+                KeyCode::Char(c) => directory_query.push(c),
                 KeyCode::Backspace => {
-                    diretory_query.pop();
+                    directory_query.pop();
                 }
                 KeyCode::Up => dir_list_state.select_previous(),
                 KeyCode::Down => dir_list_state.select_next(),
@@ -340,15 +167,15 @@ async fn run_app<B: ratatui::backend::Backend>(
         // for all keystrokes, even those that does not have an impact on the results presented.
         // ex. Using up and down arrows to navigate.
         if file_query != last_file_query && current_app_mode == AppMode::FileSearch {
-            let query_as_bytes = prepare_fuzzy_target(&file_query);
-            filtered_files = greedy_match_filter(query_as_bytes, &cached_paths);
+            let query_as_bytes = greedy_match::prepare_fuzzy_target(&file_query);
+            filtered_files = greedy_match::greedy_match_filter(query_as_bytes, &cached_paths);
             last_file_query = file_query.clone();
         }
 
-        if diretory_query != last_directory_query && current_app_mode == AppMode::DirSearch {
-            let dirs_query_as_bytes = prepare_fuzzy_target(&diretory_query);
-            filtered_dirs = greedy_match_filter(dirs_query_as_bytes, &cached_dirs);
-            last_directory_query = diretory_query.clone();
+        if directory_query != last_directory_query && current_app_mode == AppMode::DirSearch {
+            let dirs_query_as_bytes = greedy_match::prepare_fuzzy_target(&directory_query);
+            filtered_dirs = greedy_match::greedy_match_filter(dirs_query_as_bytes, &cached_dirs);
+            last_directory_query = directory_query.clone();
         }
 
         // TUI rendering
@@ -362,7 +189,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 .split(f.area());
 
             let upper_horizontal_chunks = Layout::default()
-                .direction(Direction::Horizontal)
+                .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(chunks[0]);
 
@@ -414,7 +241,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             // Define input widget.
             let current_query_to_show = match current_app_mode {
                 AppMode::FileSearch => &file_query,
-                AppMode::DirSearch => &diretory_query,
+                AppMode::DirSearch => &directory_query,
             };
 
             let input = Paragraph::new(Text::from(Span::raw(current_query_to_show)))
