@@ -7,11 +7,10 @@ use ratatui::prelude::CrosstermBackend;
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListDirection, ListState, Paragraph};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::borrow::Cow;
 
 use std::io::{self};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod fs_walk;
 mod greedy_match;
@@ -25,20 +24,15 @@ mod persistence;
 // TODO perhaps let walk_dir_par return an iter? as there is technically no need to collect it?
 // TODO refactor code to be more modular?
 
-#[derive(PartialEq, Eq)]
-enum AppMode {
-    FileSearch,
-    DirSearch,
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file = "paths.bincode";
+
     //let start = Instant::now();
-    //let file_population = fs_walk::walk_dir_par(Path::new("/"));
+    //let file_population = fs_walk::walk_dir_par(Path::new("."));
     //println!("{:?}", start.elapsed());
-    //let file_population = tokio::task::spawn_blocking(|| walk_dir_par(Path::new("/"))).await?;
     //persistence::save_paths(&file_population, file)?;
+
     let file_population = persistence::load_paths(file).await?;
 
     enable_raw_mode()?;
@@ -76,13 +70,6 @@ async fn run_app<B: ratatui::backend::Backend>(
     let mut file_list_state = ListState::default().with_selected(Some(0));
     let mut filtered_files: Vec<Cow<str>> = Vec::new();
 
-    let mut current_app_mode = AppMode::FileSearch;
-
-    let mut directory_query = String::new();
-    let mut last_directory_query = String::from(" ");
-    let mut filtered_dirs: Vec<Cow<str>> = Vec::new();
-    let mut dir_list_state = ListState::default().with_selected(Some(0));
-
     // Pre-processing stored files.
     // Currently matching is only performed on the file name
     // and not the full path, while the full path is displayed
@@ -90,18 +77,7 @@ async fn run_app<B: ratatui::backend::Backend>(
     // to bytes for faster iterations compared to chars().
     // Space stripped file name is stored as bytes at pos 0 of the tuple,
     // while the full path is stored at pos 1.
-    let cached_paths = greedy_match::prepare_paths_for_seach(&file_population);
-
-    let raw_dirs = fs_walk::unique_parent_dirs(&file_population).await;
-    let cached_dirs: Vec<(Vec<u8>, Cow<str>)> = raw_dirs
-        .par_iter()
-        .map(|s| {
-            (
-                s.to_lowercase().bytes().filter(|b| *b != b' ').collect(),
-                Cow::Owned(s.clone()),
-            )
-        })
-        .collect();
+    let cached_paths = greedy_match::prepare_paths_for_search(&file_population);
 
     // Create channel for keystrokes using tokio.
     // Used to decouple keystrokes from other logic.
@@ -135,47 +111,26 @@ async fn run_app<B: ratatui::backend::Backend>(
         .unwrap();
 
     while let Some(event) = rx_query.recv().await {
-        match current_app_mode {
-            AppMode::FileSearch => match event.code {
-                KeyCode::Char(':') => current_app_mode = AppMode::DirSearch,
-                KeyCode::Esc => break,
-                KeyCode::Char(' ') => continue,
-                KeyCode::Char(c) => file_query.push(c),
-                KeyCode::Backspace => {
-                    file_query.pop();
-                }
-                KeyCode::Up => file_list_state.select_previous(),
-                KeyCode::Down => file_list_state.select_next(),
-                _ => {}
-            },
-            AppMode::DirSearch => match event.code {
-                KeyCode::Char(':') => current_app_mode = AppMode::FileSearch,
-                KeyCode::Esc => break,
-                KeyCode::Char(' ') => continue,
-                KeyCode::Char(c) => directory_query.push(c),
-                KeyCode::Backspace => {
-                    directory_query.pop();
-                }
-                KeyCode::Up => dir_list_state.select_previous(),
-                KeyCode::Down => dir_list_state.select_next(),
-                _ => {}
-            },
+        match event.code {
+            KeyCode::Esc => break,
+            KeyCode::Char(' ') => continue,
+            KeyCode::Char(c) => file_query.push(c),
+            KeyCode::Backspace => {
+                file_query.pop();
+            }
+            KeyCode::Up => file_list_state.select_previous(),
+            KeyCode::Down => file_list_state.select_next(),
+            _ => {}
         }
 
         // Matching logic is only applied if query is updated. Due to the tui rendeing being
         // event drive, not having this condition would cause the matching logic to be be applied
         // for all keystrokes, even those that does not have an impact on the results presented.
         // ex. Using up and down arrows to navigate.
-        if file_query != last_file_query && current_app_mode == AppMode::FileSearch {
+        if file_query != last_file_query {
             let query_as_bytes = greedy_match::prepare_fuzzy_target(&file_query);
             filtered_files = greedy_match::greedy_match_filter(query_as_bytes, &cached_paths);
             last_file_query = file_query.clone();
-        }
-
-        if directory_query != last_directory_query && current_app_mode == AppMode::DirSearch {
-            let dirs_query_as_bytes = greedy_match::prepare_fuzzy_target(&directory_query);
-            filtered_dirs = greedy_match::greedy_match_filter(dirs_query_as_bytes, &cached_dirs);
-            last_directory_query = directory_query.clone();
         }
 
         // TUI rendering
@@ -188,11 +143,6 @@ async fn run_app<B: ratatui::backend::Backend>(
                 .constraints([Constraint::Min(1), Constraint::Length(3)])
                 .split(f.area());
 
-            let upper_horizontal_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(chunks[0]);
-
             // Define overarching style.
             let app_style = Style::default()
                 .bg(Color::Rgb(31, 35, 53))
@@ -203,8 +153,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                 filtered_files
                     .iter()
                     .take(25)
-                    .map(|s| s.to_string())
-                    .collect::<Vec<String>>(),
+                    .map(|s| s.as_ref())
+                    .collect::<Vec<&str>>(),
             )
             .style(app_style)
             .block(
@@ -218,43 +168,14 @@ async fn run_app<B: ratatui::backend::Backend>(
             .highlight_spacing(ratatui::widgets::HighlightSpacing::Always)
             .direction(ListDirection::TopToBottom);
 
-            // Define directories widget.
-            let dir_results: List = List::new(
-                filtered_dirs
-                    .iter()
-                    .take(25)
-                    .map(|s| s.to_string())
-                    .collect::<Vec<String>>(),
-            )
-            .style(app_style)
-            .block(
-                Block::default()
-                    .title(format!("{}", filtered_dirs.len()))
-                    .borders(Borders::ALL),
-            )
-            .highlight_style(Style::new().italic().bold())
-            .highlight_symbol(">>")
-            .repeat_highlight_symbol(true)
-            .highlight_spacing(ratatui::widgets::HighlightSpacing::Always)
-            .direction(ListDirection::TopToBottom);
-
             // Define input widget.
-            let current_query_to_show = match current_app_mode {
-                AppMode::FileSearch => &file_query,
-                AppMode::DirSearch => &directory_query,
-            };
 
-            let input = Paragraph::new(Text::from(Span::raw(current_query_to_show)))
+            let input = Paragraph::new(Text::from(Span::raw(&file_query)))
                 .style(app_style)
                 .block(Block::default().title("lazy-find").borders(Borders::ALL));
 
             // Render widgets.
-            f.render_stateful_widget(
-                file_results,
-                upper_horizontal_chunks[0],
-                &mut file_list_state,
-            );
-            f.render_stateful_widget(dir_results, upper_horizontal_chunks[1], &mut dir_list_state);
+            f.render_stateful_widget(file_results, chunks[0], &mut file_list_state);
             f.render_widget(input, chunks[1]);
         })?;
         //}

@@ -13,15 +13,11 @@ pub fn greedy_match_filter<'a>(
     target: Vec<u8>,
     pre_processed: &'a [(Vec<u8>, Cow<'a, str>)],
 ) -> Vec<Cow<'a, str>> {
-    let mut matched: Vec<(i32, Cow<str>)> = pre_processed
+    let mut matched: Vec<(i32, &Cow<str>)> = pre_processed
         .par_iter()
         .filter_map(|(value, disp)| {
             let (is_match, score) = greedy_match_score(&target, value);
-            if is_match {
-                Some((score, disp.clone()))
-            } else {
-                None
-            }
+            if is_match { Some((score, disp)) } else { None }
         })
         .collect();
 
@@ -29,7 +25,7 @@ pub fn greedy_match_filter<'a>(
 
     matched
         .into_par_iter()
-        .map(|(_, path)| path)
+        .map(|(_, path)| path.clone())
         .collect::<Vec<Cow<str>>>()
 }
 
@@ -39,6 +35,10 @@ fn greedy_match_score(query_bytes: &[u8], target_bytes: &[u8]) -> (bool, i32) {
     let mut score = 0;
     let mut last_match_idx = None;
     let mut first_match_idx = None;
+
+    //if !query_bytes.is_empty() && !target_bytes.contains(&query_bytes[0]) {
+    //    return (false, 0);
+    //}
 
     for (t_idx, &t_char) in target_bytes.iter().enumerate() {
         if q_idx == query_bytes.len() {
@@ -84,7 +84,7 @@ pub fn prepare_fuzzy_target(target: &str) -> Vec<u8> {
         .collect()
 }
 
-pub fn prepare_paths_for_seach<'a>(paths: &'a [PathBuf]) -> Vec<(Vec<u8>, Cow<'a, str>)> {
+pub fn prepare_paths_for_search<'a>(paths: &'a [PathBuf]) -> Vec<(Vec<u8>, Cow<'a, str>)> {
     paths
         .par_iter()
         .filter_map(|s| {
@@ -95,9 +95,9 @@ pub fn prepare_paths_for_seach<'a>(paths: &'a [PathBuf]) -> Vec<(Vec<u8>, Cow<'a
                 .bytes()
                 .filter(|b| *b != b' ')
                 .collect();
-            let full_path = s.to_string_lossy();
+            let full_path: String = s.to_string_lossy().into_owned();
 
-            Some((file_name, Cow::Owned(full_path.into_owned())))
+            Some((file_name, Cow::Owned(full_path)))
         })
         .collect()
 }

@@ -422,6 +422,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "crossterm 0.29.0",
+ "memchr",
  "notify",
  "ratatui",
  "rayon",

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 bincode = "2.0.1"
 crossterm = "0.29.0"
+memchr = "2.7.5"
 notify = "8.1.0"
 ratatui = "0.29.0"
 rayon = "1.10.0"
