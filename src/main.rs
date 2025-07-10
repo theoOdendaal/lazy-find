@@ -8,24 +8,24 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListDirection, ListState, Paragraph};
 use std::borrow::Cow;
+use std::path::PathBuf;
 
-use std::io::{self};
-use std::path::{Path, PathBuf};
-
+mod error;
 mod fs_walk;
 mod greedy_match;
 mod persistence;
 
-// TODO use more effecient data structures?
-// TODO, currently spaces are ignored? It's not even pushed to query. Is this fine?
+// TODO use more effecient data structures ?
+// TODO, currently spaces are ignored? It's not even pushed to query. Is this fine ?
 // TODO better manage list selection. As currently it remains constant when typing and then falls off when selected exceeds index.
 // TODO update query asynchronous and add debouncing to filter logic. i.e. query should be updated independently of filtering logic, and only apply filtering logic after a delay.
 // TODO implement a watcher using notify, in order to update fs data without having to rescan entire disk during runtime.
-// TODO perhaps let walk_dir_par return an iter? as there is technically no need to collect it?
-// TODO refactor code to be more modular?
+// TODO perhaps let walk_dir_par return an iter? as there is technically no need to collect it ?
+// TODO refactor code to be more modular ?
+// TODO add logging/profiling ?
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), error::LazyError> {
     let file = "paths.bincode";
 
     //let start = Instant::now();
@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file_population = persistence::load_paths(file).await?;
 
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
+    let mut stdout = std::io::stdout();
 
     execute!(
         stdout,
@@ -56,17 +56,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         crossterm::event::DisableMouseCapture
     )?;
     terminal.show_cursor()?;
-
-    Ok(result?)
+    result
 }
 
 async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     file_population: Vec<PathBuf>,
-) -> io::Result<()> {
-    let mut file_query = String::new();
+) -> Result<(), error::LazyError> {
     // Initialze last_query as " ", otherwise tui won't render.
-    let mut last_file_query = String::from(" ");
+    let (mut query, mut last_query) = (String::new(), String::from(" "));
     let mut file_list_state = ListState::default().with_selected(Some(0));
     let mut filtered_files: Vec<Cow<str>> = Vec::new();
 
@@ -114,9 +112,9 @@ async fn run_app<B: ratatui::backend::Backend>(
         match event.code {
             KeyCode::Esc => break,
             KeyCode::Char(' ') => continue,
-            KeyCode::Char(c) => file_query.push(c),
+            KeyCode::Char(c) => query.push(c),
             KeyCode::Backspace => {
-                file_query.pop();
+                query.pop();
             }
             KeyCode::Up => file_list_state.select_previous(),
             KeyCode::Down => file_list_state.select_next(),
@@ -127,10 +125,10 @@ async fn run_app<B: ratatui::backend::Backend>(
         // event drive, not having this condition would cause the matching logic to be be applied
         // for all keystrokes, even those that does not have an impact on the results presented.
         // ex. Using up and down arrows to navigate.
-        if file_query != last_file_query {
-            let query_as_bytes = greedy_match::prepare_fuzzy_target(&file_query);
+        if query != last_query {
+            let query_as_bytes = greedy_match::prepare_fuzzy_target(&query);
             filtered_files = greedy_match::greedy_match_filter(query_as_bytes, &cached_paths);
-            last_file_query = file_query.clone();
+            last_query = query.clone();
         }
 
         // TUI rendering
@@ -169,8 +167,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             .direction(ListDirection::TopToBottom);
 
             // Define input widget.
-
-            let input = Paragraph::new(Text::from(Span::raw(&file_query)))
+            let input = Paragraph::new(Text::from(Span::raw(&query)))
                 .style(app_style)
                 .block(Block::default().title("lazy-find").borders(Borders::ALL));
 
